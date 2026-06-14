@@ -109,15 +109,17 @@ def billable_reading(raw_total: float) -> float:
     return float(raw_total)
 
 
-def compute_sheet_total(csv_text: str, totals: dict[str, float]) -> dict:
-    """Sum the Current Reading column of the *updated* reimbursement sheet.
+def build_updated_sheet(csv_text: str, totals: dict[str, float], description: str) -> dict:
+    """Fill the reimbursement sheet and sum its Current Reading column.
 
-    For each data row: matched flats use the billable consumption total; rows with no
-    consumption match (clubhouse / non-member / common-area) keep their existing reading.
-    Returns a breakdown dict.
+    For each data row: matched flats get the billable consumption total in 'Current Reading';
+    rows with no consumption match (clubhouse / non-member / common-area) keep their existing
+    reading. Every data row's 'Description' is set to `description`.
+
+    Returns a breakdown dict including `csv_text` — the updated sheet ready for download.
     """
     rows = list(csv.reader(io.StringIO(csv_text)))
-    CUR = 2                                        # 'Current Reading' column index
+    CUR, DESC = 2, 4                               # 'Current Reading' / 'Description' columns
 
     grand_total = 0.0
     matched = zeroed = unmatched = 0
@@ -130,6 +132,7 @@ def compute_sheet_total(csv_text: str, totals: dict[str, float]) -> dict:
         key = _normalise_flat(house)
         if key in totals:
             reading = billable_reading(totals[key])
+            row[CUR] = f"{reading:.3f}"            # write reading, keep the 3-decimal column style
             if reading == 0.0:
                 zeroed += 1
             matched += 1
@@ -139,8 +142,13 @@ def compute_sheet_total(csv_text: str, totals: dict[str, float]) -> dict:
             except ValueError:
                 reading = 0.0
             unmatched += 1
-            unmatched_rows.append(house)
+            unmatched_rows.append(house)           # reading left unchanged
+        if len(row) > DESC:
+            row[DESC] = description                # update description for every data row
         grand_total += reading
+
+    out = io.StringIO()
+    csv.writer(out).writerows(rows)
 
     return {
         "grand_total": grand_total,
@@ -148,6 +156,7 @@ def compute_sheet_total(csv_text: str, totals: dict[str, float]) -> dict:
         "zeroed": zeroed,
         "unmatched": unmatched,
         "unmatched_rows": unmatched_rows,
+        "csv_text": out.getvalue(),
     }
 
 
@@ -187,84 +196,111 @@ def main() -> None:
     cke = c3.number_input("CKE water tanker bill", min_value=0.0, step=100.0, format="%.2f")
 
     st.subheader("3 · Generate")
-    if not st.button(f"Generate {prev_label} bill", type="primary"):
+    if st.button(f"Generate {prev_label} bill", type="primary"):
+        # Compute on click and stash in session_state so the result (and its download
+        # button) survive the rerun that Streamlit triggers when the button is pressed.
+        st.session_state["result"] = _generate(
+            cons_file, csv_file, cauvery, sse, cke, today, (py, pm), prev_label
+        )
+
+    result = st.session_state.get("result")
+    if result is None:
+        return
+    if result.get("error"):
+        st.error(result["error"])
         return
 
-    # --- validation -------------------------------------------------------- #
+    _render_result(st, result)
+
+
+def _generate(cons_file, csv_file, cauvery, sse, cke, today, prev, prev_label) -> dict:
+    """Validate inputs and compute the result. Returns {'error': msg} or a result dict."""
+    py, pm = prev
     if cons_file is None or csv_file is None:
-        st.error("Please upload both the consumption report and the reimbursement template.")
-        return
+        return {"error": "Please upload both the consumption report and the reimbursement template."}
 
     parsed = parse_month_from_filename(cons_file.name)
     if parsed is None:
-        st.error(
+        return {"error": (
             f"Could not read a month and year from the filename '{cons_file.name}'. "
             "Rename it to include both, e.g. 'Consumption Report May-2026.xlsx'."
-        )
-        return
+        )}
 
     file_year, file_month = parsed
     file_label = f"{calendar.month_name[file_month]} {file_year}"
-
     if (file_year, file_month) == (today.year, today.month):
-        st.error(
+        return {"error": (
             f"❌ The uploaded sheet is for the **current month** ({file_label}). "
             f"Current-month bills cannot be generated — upload the previous month ({prev_label})."
-        )
-        return
+        )}
     if (file_year, file_month) != (py, pm):
-        st.error(
+        return {"error": (
             f"❌ The uploaded sheet is for **{file_label}**, but only the previous month "
             f"(**{prev_label}**) can be billed. Please upload the correct sheet."
-        )
-        return
+        )}
 
     total_cost = cauvery + sse + cke
     if total_cost <= 0:
-        st.error("Enter at least one non-zero water-supply bill amount.")
-        return
+        return {"error": "Enter at least one non-zero water-supply bill amount."}
 
-    # --- compute ----------------------------------------------------------- #
     try:
         totals = load_consumption_totals(cons_file)
         csv_text = csv_file.getvalue().decode("utf-8-sig")
-        breakdown = compute_sheet_total(csv_text, totals)
+        breakdown = build_updated_sheet(csv_text, totals, prev_label)
     except Exception as exc:  # noqa: BLE001 — surface any parse error to the user
-        st.error(f"Failed to process the sheets: {exc}")
-        return
+        return {"error": f"Failed to process the sheets: {exc}"}
 
     grand_total = breakdown["grand_total"]
     if grand_total <= 0:
-        st.error("Total billable consumption is 0 — cannot compute a per-litre cost.")
-        return
+        return {"error": "Total billable consumption is 0 — cannot compute a per-litre cost."}
 
-    per_litre = total_cost / grand_total
+    return {
+        "prev_label": prev_label,
+        "cauvery": cauvery, "sse": sse, "cke": cke,
+        "total_cost": total_cost,
+        "grand_total": grand_total,
+        "per_litre": total_cost / grand_total,
+        "breakdown": breakdown,
+        "download_name": f"Reimbursement Towards Monthly Water Bill - "
+                         f"{calendar.month_name[pm]}-{py}.csv",
+    }
 
-    # --- result ------------------------------------------------------------ #
-    st.success(f"Per-litre water cost for **{prev_label}**")
-    st.metric("Per-litre cost", f"₹ {per_litre:,.4f} / litre")
+
+def _render_result(st, r: dict) -> None:
+    b = r["breakdown"]
+    st.success(f"Per-litre water cost for **{r['prev_label']}**")
+    st.metric("Per-litre cost", f"₹ {r['per_litre']:,.4f} / litre")
 
     st.markdown("#### Calculation breakdown")
     st.markdown(
-        f"- Cauvery bill: ₹ {cauvery:,.2f}\n"
-        f"- SSE tanker bill: ₹ {sse:,.2f}\n"
-        f"- CKE tanker bill: ₹ {cke:,.2f}\n"
-        f"- **Total supply cost:** ₹ {total_cost:,.2f}\n"
+        f"- Cauvery bill: ₹ {r['cauvery']:,.2f}\n"
+        f"- SSE tanker bill: ₹ {r['sse']:,.2f}\n"
+        f"- CKE tanker bill: ₹ {r['cke']:,.2f}\n"
+        f"- **Total supply cost:** ₹ {r['total_cost']:,.2f}\n"
         f"- **Total billable consumption (updated sheet grand total):** "
-        f"{grand_total:,.0f} litres\n"
-        f"- **Per-litre cost = {total_cost:,.2f} ÷ {grand_total:,.0f} = "
-        f"₹ {per_litre:,.6f} / litre**"
+        f"{r['grand_total']:,.0f} litres\n"
+        f"- **Per-litre cost = {r['total_cost']:,.2f} ÷ {r['grand_total']:,.0f} = "
+        f"₹ {r['per_litre']:,.6f} / litre**"
+    )
+
+    st.markdown("#### Download")
+    st.download_button(
+        "⬇️ Download updated reimbursement sheet (.csv)",
+        data=b["csv_text"].encode("utf-8-sig"),
+        file_name=r["download_name"],
+        mime="text/csv",
+        type="primary",
     )
 
     with st.expander("Sheet processing details"):
         st.write(
-            f"- Flats matched from consumption sheet: **{breakdown['matched']}**\n"
-            f"- Flats below {SUB_THRESHOLD_LITRES} L billed as 0: **{breakdown['zeroed']}**\n"
+            f"- Flats matched from consumption sheet: **{b['matched']}**\n"
+            f"- Flats below {SUB_THRESHOLD_LITRES} L billed as 0: **{b['zeroed']}**\n"
             f"- Non-flat rows kept as-is (clubhouse / non-member / common area): "
-            f"**{breakdown['unmatched']}**"
+            f"**{b['unmatched']}**"
         )
-        if breakdown["unmatched_rows"]:
-            st.caption("Non-flat / unmatched rows: " + ", ".join(breakdown["unmatched_rows"]))
+        if b["unmatched_rows"]:
+            st.caption("Non-flat / unmatched rows: " + ", ".join(b["unmatched_rows"]))
 
 
 if __name__ == "__main__":
